@@ -1,0 +1,92 @@
+version: '3.8'
+
+services:
+  inventory-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: inventory_user
+      POSTGRES_PASSWORD: inventory_password
+      POSTGRES_DB: inventory_db
+    volumes:
+      - inventory_data:/var/lib/postgresql/data
+      - ./inventory-db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inventory_user -d inventory_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  inventory-service:
+    build: ./inventory
+    environment:
+      - PORT=3001
+      - DB_USER=inventory_user
+      - DB_PASSWORD=inventory_password
+      - DB_HOST=inventory-db
+      - DB_PORT=5432
+      - DB_NAME=inventory_db
+    ports:
+      - "3001:3001"
+    depends_on:
+      inventory-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  orders-service:
+    build: ./orders
+    environment:
+      - PORT=3002
+    volumes:
+      - orders_data:/usr/src/app/data
+    ports:
+      - "3002:3002"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  coordinator:
+    build: ./coordinator
+    environment:
+      - PORT=3000
+      - INVENTORY_URL=http://inventory-service:3001
+      - ORDERS_URL=http://orders-service:3002
+    volumes:
+      - ./data:/usr/src/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "3000:3000"
+    depends_on:
+      inventory-service:
+        condition: service_healthy
+      orders-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:3000
+      - VITE_WS_URL=ws://localhost:3000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5173"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  inventory_data:
+  orders_data:
