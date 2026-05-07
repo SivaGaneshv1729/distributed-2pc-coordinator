@@ -1,33 +1,84 @@
 # Transactional Inventory System with 2-Phase Commit (2PC)
 
-This project demonstrates a distributed inventory and order processing system utilizing the Two-Phase Commit (2PC) protocol to guarantee data consistency across microservices with heterogeneous data stores (PostgreSQL and SQLite). 
+This project demonstrates a distributed inventory and order processing system utilizing the **Two-Phase Commit (2PC)** protocol to guarantee data consistency across microservices with heterogeneous data stores (PostgreSQL and SQLite).
 
-## Running the Application
+## 1. Overview
+In modern microservices, maintaining data consistency across different databases is a significant challenge. This project solves the "distributed transaction problem" by implementing a custom 2PC coordinator and participant logic from scratch, ensuring that stock deductions and order creation happen atomically.
 
+## 2. Architecture Diagram
+
+```mermaid
+graph TD
+    Client[Client / UI] -->|POST /api/transactions| Coordinator[2PC Coordinator]
+    Coordinator -->|1. Prepare| InvSvc[Inventory Service]
+    Coordinator -->|1. Prepare| OrdSvc[Orders Service]
+    
+    InvSvc -->|PostgreSQL| InvDB[(Inventory DB)]
+    OrdSvc -->|SQLite| OrdDB[(Orders DB)]
+    
+    Coordinator -->|2. Commit/Rollback| InvSvc
+    Coordinator -->|2. Commit/Rollback| OrdSvc
+    
+    Coordinator -.->|WAL| Log[(WAL Log File)]
+    Coordinator -.->|Broadcast| WS[WebSocket Updates]
+    WS -.->|Real-time| Client
+```
+
+## 3. The Two-Phase Commit (2PC) Protocol
+
+### Phase 1: Voting / Prepare
+1.  **BEGIN**: Coordinator assigns a unique `transaction_id` and writes a `BEGIN` record to the Write-Ahead Log (WAL).
+2.  **PREPARE**: Coordinator sends a `/prepare` request to all participants concurrently.
+3.  **Vote**:
+    *   **Inventory Service**: Acquires row-level locks (`SELECT ... FOR UPDATE`), verifies stock, and records the state as `PREPARED`.
+    *   **Orders Service**: Creates an order record with status `PREPARED`.
+4.  **Acknowledgment**: Each participant returns `200 OK` (Vote Commit) or `409/500` (Vote Abort).
+
+### Phase 2: Completion
+1.  **Decision**: If all participants voted Commit, the Coordinator writes `GLOBAL_COMMIT` to the WAL. If any voted Abort, it writes `GLOBAL_ABORT`.
+2.  **Action**: Coordinator sends `/commit` or `/rollback` to all participants.
+3.  **Finalization**: Once participants acknowledge, the Coordinator writes `END` to the WAL.
+
+## 4. Getting Started
+
+### Prerequisites
+*   Docker and Docker Compose installed.
+
+### Running the Application
 To start the entire application, use Docker Compose from the root directory:
 
 ```bash
 docker-compose up --build
 ```
 
-### Services Included
-- **Coordinator Service** (Port 3000): Central brain of the 2PC protocol.
-- **Inventory Service** (Port 3001): Manages product stock (PostgreSQL).
-- **Orders Service** (Port 3002): Manages order records (SQLite).
-- **Frontend Monitor UI** (Port 5173): React dashboard for real-time visualization.
-- **Inventory Database** (Port 5432): PostgreSQL instance containing product data.
+### Accessing the System
+*   **Monitor UI**: [http://localhost:5173](http://localhost:5173)
+*   **Coordinator API**: [http://localhost:3000](http://localhost:3000)
+*   **Inventory Service**: [http://localhost:3001](http://localhost:3001)
+*   **Orders Service**: [http://localhost:3002](http://localhost:3002)
 
-## Analysis and Architectural Considerations
+## 5. Component Breakdown
 
-### The Blocking Problem in 2PC
-Two-Phase Commit provides strong consistency (atomicity), ensuring that all participants either commit or abort. However, 2PC's fundamental weakness is **The Blocking Problem**. 
+### 5.1. Coordinator Service (Node.js/Express)
+*   **State Machine**: Manages the lifecycle of transactions.
+*   **Write-Ahead Log (WAL)**: Ensures durability. The log is an append-only JSON line file located in `./data/coordinator.log`.
+*   **Recovery Logic**: On startup, the coordinator scans the WAL and resolves any "In-Doubt" transactions automatically.
+*   **WebSocket Server**: Broadcasts state changes to the UI for real-time monitoring.
 
-If the transaction coordinator crashes after Phase 1 (Prepare) has successfully completed, but before it can write the final `GLOBAL_COMMIT` or `GLOBAL_ABORT` decision to its Write-Ahead Log (WAL) and inform the participants, the participants are left in a "blocked" or "in-doubt" state. 
+### 5.2. Participant Services
+*   **Inventory Service (PostgreSQL)**: Manages stock levels using strict row-level locking during the prepare phase.
+*   **Orders Service (SQLite)**: Demonstrates heterogeneity by using a different data store while maintaining transactional integrity.
 
-While in this state, participants hold exclusive database locks on the resources (e.g., inventory rows) involved in the transaction. Because they cannot independently decide to commit or abort without risking data inconsistency, they must wait indefinitely until the coordinator recovers and communicates the final decision. During this downtime, any other transaction attempting to modify those locked resources will be blocked, causing severe availability issues for the entire system.
+### 5.3. Frontend Monitor (React)
+*   **Real-time Visualization**: Displays every step of the 2PC process.
+*   **Chaos Engineering**: Features a "Chaos Button" to kill services via the Coordinator's Docker bridge, allowing you to test system resilience.
 
-### 2PC vs. Saga Pattern
-When designing distributed systems, architects must choose between strong consistency (2PC) and high availability (Sagas).
+## 6. Fault Tolerance & Recovery
+*   **Service Crash**: If a participant crashes after voting, the Coordinator retries the final decision until it succeeds.
+*   **Coordinator Crash**: Upon restart, the WAL provides the "Ground Truth," allowing the system to finish pending commits or rollbacks.
+*   **Idempotency**: All completion endpoints (`/commit`, `/rollback`) are idempotent, ensuring safety during recovery cycles.
+
+## 7. Analysis: 2PC vs. Saga Pattern
 
 | Feature | Two-Phase Commit (2PC) | Saga Pattern |
 | :--- | :--- | :--- |
@@ -36,12 +87,5 @@ When designing distributed systems, architects must choose between strong consis
 | **Performance** | Slower (requires locking resources) | Faster (local transactions only) |
 | **Rollback** | Automatic (handled by DB engine) | Manual (Requires compensating transactions) |
 
-**When to use 2PC:**
-- Ideal for use cases requiring absolute atomic consistency, where intermediate or eventual consistency is unacceptable.
-- Common in financial systems, legacy databases, or short-lived transactions spanning a small number of internal microservices on a reliable network.
-
-**When to use Sagas:**
-- Ideal for long-running business processes spanning multiple domains where holding locks is impractical.
-- Better suited for highly available e-commerce systems, microservices architectures, and integrations with third-party APIs that do not support 2PC protocols. 
-
-In the Saga pattern, if a step fails, the system executes a series of compensating transactions to undo the previous successful steps. While it requires more complex application logic to handle compensations, it completely avoids the distributed blocking problem inherent to 2PC.
+### The Blocking Problem in 2PC
+2PC's fundamental weakness is **The Blocking Problem**. If the coordinator fails at a critical moment (after Prepare but before Commit), participants remain in an "in-doubt" state, holding exclusive locks on resources indefinitely. This is why many high-availability systems prefer the **Saga Pattern** or **Eventual Consistency** models.
